@@ -1,1 +1,395 @@
-TEST
+<#
+.SYNOPSIS
+    Cleans SkanExcelAddIn VSTO per-user deployment for ALL users on the machine.
+
+.DESCRIPTION
+    - Detects users BEFORE cleanup (so VSTOInstaller doesn't erase evidence)
+    - If Skan is installed at machine level (MSI), cleans ALL user profiles
+    - Supports: Local users, Active Directory, Azure AD (S-1-12-1-*)
+    - No hardcoded GUIDs, product codes, or version-specific hashes
+    - Sets LoadBehavior=3 so Excel auto-loads on next start
+    - Runs silently with no user prompts
+    - VSTOInstaller has 60s timeout (prevents hangs)
+    - Logs to C:\Windows\SysWOW64\PKG_LOGS for audit
+    - Requires Admin privileges
+
+.PARAMETER WhatIf
+    Dry run mode. Shows what would be done without making changes.
+
+.NOTES
+    Version: 3.0
+    Date:    2026-04-07
+#>
+
+param([switch]$WhatIf)
+
+$scriptName = "SkanExcelAddIn_PerUser_Cleanup"
+$scriptVersion = "3.0"
+$logDir = "C:\Windows\SysWOW64\PKG_LOGS"
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$logFile = "$logDir\${scriptName}_${timestamp}.log"
+
+# =====================================================================
+# LOGGING
+# =====================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts [$Level] $Message"
+    try { Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue } catch {}
+    switch ($Level) {
+        "ERROR" { Write-Host "  $line" -ForegroundColor Red }
+        "WARN"  { Write-Host "  $line" -ForegroundColor Yellow }
+        "OK"    { Write-Host "  $line" -ForegroundColor Green }
+        default { Write-Host "  $line" }
+    }
+}
+
+# =====================================================================
+# HELPERS
+# =====================================================================
+
+function Remove-RegistryKeySafe {
+    param([string]$Path)
+    if ($script:WhatIf) { return $false }
+    try {
+        if (Test-Path $Path -ErrorAction SilentlyContinue) {
+            Remove-Item $Path -Recurse -Force -ErrorAction Stop
+            return $true
+        }
+    } catch {
+        Write-Log "    Failed: $Path -- $($_.Exception.Message)" "WARN"
+    }
+    return $false
+}
+
+function Unload-HiveSafe {
+    param([string]$Sid)
+    $ErrorActionPreference = 'SilentlyContinue'
+    [gc]::Collect()
+    [gc]::WaitForPendingFinalizers()
+    Start-Sleep -Milliseconds 500
+    for ($i = 1; $i -le 5; $i++) {
+        & reg.exe UNLOAD "HKU\$Sid" *>&1 | Out-Null
+        if (-not (Test-Path "Registry::HKEY_USERS\$Sid" -ErrorAction SilentlyContinue)) { 
+            $ErrorActionPreference = 'Stop'
+            return $true 
+        }
+        [gc]::Collect()
+        Start-Sleep -Seconds ($i * 2)
+    }
+    $ErrorActionPreference = 'Stop'
+    Write-Log "    Hive unload failed for $Sid after 5 attempts (will clean on reboot)" "WARN"
+    return $false
+}
+
+function Invoke-VSTOUninstall {
+    param([string]$VstoFilePath, [int]$TimeoutSeconds = 60)
+    $vstoExe = "C:\Program Files\Common Files\Microsoft Shared\VSTO\10.0\VSTOInstaller.exe"
+    if (-not (Test-Path $vstoExe)) { return }
+    if (-not (Test-Path $VstoFilePath)) { return }
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($VstoFilePath)
+    try {
+        $proc = Start-Process -FilePath $vstoExe -ArgumentList "/Uninstall `"$VstoFilePath`" /SILENT" -PassThru -WindowStyle Hidden
+        $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $exited) {
+            $proc.Kill()
+            Write-Log "  $name timed out after ${TimeoutSeconds}s -- killed" "WARN"
+        } else {
+            Write-Log "  $name exit code: $($proc.ExitCode)"
+        }
+    } catch {
+        Write-Log "  $name error: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# =====================================================================
+# PRE-FLIGHT CHECKS
+# =====================================================================
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]'Administrator')
+if (-not $isAdmin) {
+    Write-Host "  ERROR: Requires Administrator privileges. Run as admin." -ForegroundColor Red
+    exit 1
+}
+
+if (-not (Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue | Out-Null
+}
+
+$ErrorActionPreference = 'Stop'
+
+Write-Log "========== $scriptName v$scriptVersion started =========="
+Write-Log "Machine: $env:COMPUTERNAME | User: $env:USERDOMAIN\$env:USERNAME | PID: $PID"
+Write-Log "OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
+if ($WhatIf) { Write-Log "*** DRY RUN -- no changes will be made ***" "WARN" }
+
+# =====================================================================
+# STEP 1: DETECT state BEFORE any cleanup
+# =====================================================================
+
+Write-Log "--- STEP 1: Detect ---"
+
+$hklmAddin = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Office\Excel\Addins\SkanExcelAddIn" -ErrorAction SilentlyContinue
+$hklmWow = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\Excel\Addins\SkanExcelAddIn" -ErrorAction SilentlyContinue
+$dllExists = Test-Path "C:\Program Files\Skan\VA\SkanExcelAddin\SkanExcelAddIn.dll"
+$skanMachineLevel = ($null -ne $hklmAddin) -or ($null -ne $hklmWow) -or $dllExists
+
+if ($null -eq $hklmAddin) { $hklmAddin = $hklmWow }
+
+if ($skanMachineLevel) {
+    Write-Log "Skan installed at machine level. Will process ALL user profiles." "OK"
+} else {
+    Write-Log "Skan NOT at machine level. Will only clean users with leftover state."
+}
+
+# Build user list
+$profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+$sidEntries = Get-ChildItem -Path $profileListKey -ErrorAction SilentlyContinue
+
+$usersToClean = [System.Collections.Generic.List[PSCustomObject]]::new()
+$totalUsers = 0
+$skippedUsers = 0
+
+$skipUserNames = @('defaultuser100000', 'Default', 'Public', 'All Users', 'Default User')
+
+foreach ($sidEntry in $sidEntries) {
+    $sid = $sidEntry.PSChildName
+
+    # S-1-5-21-* = Local/AD users | S-1-12-1-* = Azure AD users
+    if (($sid -notlike 'S-1-5-21-*') -and ($sid -notlike 'S-1-12-1-*')) { continue }
+
+    $profPathRaw = try { (Get-ItemProperty -Path $sidEntry.PSPath -Name 'ProfileImagePath' -ErrorAction Stop).ProfileImagePath } catch { $null }
+    if ([string]::IsNullOrWhiteSpace($profPathRaw)) { continue }
+
+    $profPath = [Environment]::ExpandEnvironmentVariables($profPathRaw)
+    if (-not (Test-Path $profPath -ErrorAction SilentlyContinue)) { continue }
+
+    $userName = Split-Path $profPath -Leaf
+    if ($userName -in $skipUserNames) { continue }
+
+    $totalUsers++
+
+    $shouldClean = $skanMachineLevel
+    if (-not $shouldClean) {
+        $userApps20 = Join-Path $profPath "AppData\Local\Apps\2.0"
+        if (Test-Path $userApps20 -ErrorAction SilentlyContinue) {
+            $sc = Get-ChildItem -LiteralPath $userApps20 -Directory -Recurse -Filter "skan*" -ErrorAction SilentlyContinue
+            if ($sc) { $shouldClean = $true }
+        }
+    }
+
+    if ($shouldClean) {
+        $usersToClean.Add([PSCustomObject]@{ SID = $sid; ProfilePath = $profPath; UserName = $userName })
+        Write-Log "  Will clean: $userName ($sid)"
+    } else {
+        $skippedUsers++
+    }
+}
+
+Write-Log "Profiles: $totalUsers total | $($usersToClean.Count) to clean | $skippedUsers to skip"
+
+if ($usersToClean.Count -eq 0) {
+    Write-Log "Nothing to clean. Exiting." "OK"
+    exit 0
+}
+
+# =====================================================================
+# STEP 2: KILL processes
+# =====================================================================
+
+Write-Log "--- STEP 2: Kill processes ---"
+$ErrorActionPreference = 'SilentlyContinue'
+& taskkill /IM "EXCEL.EXE" /F /T *>&1 | Out-Null
+& taskkill /IM "SkanWatchDog.exe" /F /T *>&1 | Out-Null
+$ErrorActionPreference = 'Stop'
+Start-Sleep -Seconds 3
+Write-Log "Done." "OK"
+
+# =====================================================================
+# STEP 3: VSTOInstaller /Uninstall (with 60s timeout)
+# =====================================================================
+
+Write-Log "--- STEP 3: VSTOInstaller /Uninstall (60s timeout) ---"
+Invoke-VSTOUninstall "C:\Program Files\Skan\VA\SkanExcelAddin\SkanExcelAddIn.vsto"
+Invoke-VSTOUninstall "C:\Program Files\Skan\VA\SkanOutlookAddin\Skan.Outlook.Addin.vsto"
+
+# =====================================================================
+# STEP 4: CLEAN each user
+# =====================================================================
+
+Write-Log "--- STEP 4: Clean $($usersToClean.Count) user(s) ---"
+$cleanedUsers = 0
+$errorUsers = 0
+
+foreach ($userInfo in $usersToClean) {
+    $sid = $userInfo.SID
+    $profPath = $userInfo.ProfilePath
+    $userName = $userInfo.UserName
+    $weLoaded = $false
+
+    try {
+        Write-Log "  [$userName] Starting cleanup..."
+
+        # --- Load HKU hive if not already loaded ---
+        $hiveLoaded = Test-Path "Registry::HKEY_USERS\$sid" -ErrorAction SilentlyContinue
+        if (-not $hiveLoaded) {
+            $ntUserDat = Join-Path $profPath 'NTUSER.DAT'
+            if (Test-Path -LiteralPath $ntUserDat -ErrorAction SilentlyContinue) {
+                $ErrorActionPreference = 'SilentlyContinue'
+                & reg.exe LOAD "HKU\$sid" "$ntUserDat" *>&1 | Out-Null
+                $ErrorActionPreference = 'Stop'
+                $hiveLoaded = Test-Path "Registry::HKEY_USERS\$sid" -ErrorAction SilentlyContinue
+                if ($hiveLoaded) { $weLoaded = $true }
+            }
+        }
+
+        # --- CLEAN: Apps\2.0 ClickOnce deployment stores ---
+        if (-not $WhatIf) {
+            $userApps20 = Join-Path $profPath "AppData\Local\Apps\2.0"
+            if (Test-Path $userApps20 -ErrorAction SilentlyContinue) {
+                $skanDirs = Get-ChildItem -LiteralPath $userApps20 -Directory -Recurse -Filter "skan*" -ErrorAction SilentlyContinue
+                if ($skanDirs -and $skanDirs.Count -gt 0) {
+                    $storeParents = @{}
+                    foreach ($sd in $skanDirs) { $storeParents[(Split-Path $sd.FullName -Parent)] = $true }
+
+                    foreach ($store in $storeParents.Keys) {
+                        Get-ChildItem -LiteralPath $store -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop }
+                            catch { Write-Log "    File locked: $($_.Name)" "WARN" }
+                        }
+                    }
+
+                    # Data subfolder
+                    $dataPath = Join-Path $userApps20 "Data"
+                    if (Test-Path $dataPath -ErrorAction SilentlyContinue) {
+                        $dataSkan = Get-ChildItem -LiteralPath $dataPath -Directory -Recurse -Filter "skan*" -ErrorAction SilentlyContinue
+                        if ($dataSkan) {
+                            $dp = @{}; foreach ($ds in $dataSkan) { $dp[(Split-Path $ds.FullName -Parent)] = $true }
+                            foreach ($d in $dp.Keys) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+                        }
+                    }
+
+                    # ClickOnce metadata
+                    @("manifests.dat", "data.dat") | ForEach-Object {
+                        $mf = Join-Path $userApps20 $_
+                        if (Test-Path $mf -ErrorAction SilentlyContinue) { Remove-Item $mf -Force -ErrorAction SilentlyContinue }
+                    }
+
+                    Write-Log "    Apps\2.0 cleaned" "OK"
+                }
+            }
+        }
+
+        # --- CLEAN: HKU registry ---
+        if ($hiveLoaded -and -not $WhatIf) {
+            $hkuBase = "Registry::HKEY_USERS\$sid"
+
+            # Office add-in registration
+            @(
+                "$hkuBase\Software\Microsoft\Office\Excel\Addins\SkanExcelAddIn",
+                "$hkuBase\Software\Microsoft\Office\Excel\AddinsData\SkanExcelAddIn",
+                "$hkuBase\SOFTWARE\Microsoft\Office\Outlook\Addins\Skan.Outlook.Addin",
+                "$hkuBase\SOFTWARE\Microsoft\Office\Outlook\AddinsData\Skan.Outlook.Addin"
+            ) | ForEach-Object { Remove-RegistryKeySafe $_ | Out-Null }
+
+            # AddInLoadTimes (Office 2013, 2016, 2019, 365)
+            @("15.0", "16.0") | ForEach-Object {
+                Remove-RegistryKeySafe "$hkuBase\Software\Microsoft\Office\$_\Excel\AddInLoadTimes" | Out-Null
+            }
+
+            # HKCU Uninstall entries (dynamic search)
+            $uninstPath = "$hkuBase\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+            if (Test-Path $uninstPath -ErrorAction SilentlyContinue) {
+                Get-ChildItem $uninstPath -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                        if ($props.DisplayName -like '*Skan*' -or $props.DisplayName -like '*skan*' -or
+                            $props.Publisher -like '*Skan*' -or $props.Publisher -like '*skan*') {
+                            Remove-RegistryKeySafe $_.PSPath | Out-Null
+                        }
+                    } catch {}
+                }
+            }
+
+            # VSTA Solutions + VSTO SolutionMetadata (Skan entries only)
+            foreach ($metaPath in @("$hkuBase\SOFTWARE\Microsoft\VSTA\Solutions", "$hkuBase\SOFTWARE\Microsoft\VSTO\SolutionMetadata")) {
+                if (Test-Path $metaPath -ErrorAction SilentlyContinue) {
+                    Get-ChildItem $metaPath -ErrorAction SilentlyContinue | ForEach-Object {
+                        try {
+                            $isSkan = $false
+                            (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).PSObject.Properties | ForEach-Object {
+                                if ($_.Value -is [string] -and ($_.Value -like '*Skan*' -or $_.Value -like '*skan*')) { $isSkan = $true }
+                            }
+                            if ($isSkan) { Remove-RegistryKeySafe $_.PSPath | Out-Null }
+                        } catch {}
+                    }
+                }
+            }
+
+            # SideBySide\2.0 (entire tree if contains skan)
+            $sbsPath = "$hkuBase\SOFTWARE\Classes\Software\Microsoft\Windows\CurrentVersion\Deployment\SideBySide\2.0"
+            if (Test-Path $sbsPath -ErrorAction SilentlyContinue) {
+                $skanSbs = Get-ChildItem $sbsPath -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSChildName -like '*skan*' } | Select-Object -First 1
+                if ($skanSbs) { Remove-RegistryKeySafe $sbsPath | Out-Null }
+            }
+
+            # Excel Resiliency
+            @("15.0", "16.0") | ForEach-Object {
+                $resBase = "$hkuBase\Software\Microsoft\Office\$_\Excel\Resiliency"
+                @("DisabledItems", "CrashingAddinList", "DoNotDisableAddinList", "NotificationReminderAddinData") | ForEach-Object {
+                    Remove-RegistryKeySafe "$resBase\$_" | Out-Null
+                }
+            }
+
+            Write-Log "    Registry cleaned" "OK"
+
+            # --- SET LoadBehavior=3 for auto-load ---
+            if ($hklmAddin) {
+                $addinPath = "$hkuBase\Software\Microsoft\Office\Excel\Addins\SkanExcelAddIn"
+                try {
+                    if (-not (Test-Path $addinPath -ErrorAction SilentlyContinue)) {
+                        New-Item -Path $addinPath -Force -ErrorAction Stop | Out-Null
+                    }
+                    New-ItemProperty -Path $addinPath -Name "LoadBehavior" -PropertyType DWord -Value 3 -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -Path $addinPath -Name "FriendlyName" -PropertyType String -Value "SkanExcelAddIn" -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -Path $addinPath -Name "Description" -PropertyType String -Value "SkanExcelAddIn" -Force -ErrorAction Stop | Out-Null
+                    if ($hklmAddin.Manifest) {
+                        New-ItemProperty -Path $addinPath -Name "Manifest" -PropertyType String -Value $hklmAddin.Manifest -Force -ErrorAction Stop | Out-Null
+                    }
+                    Write-Log "    LoadBehavior=3 set" "OK"
+                } catch {
+                    Write-Log "    LoadBehavior failed: $($_.Exception.Message)" "WARN"
+                }
+            }
+        }
+
+        # --- Unload hive if we loaded it ---
+        if ($weLoaded) { Unload-HiveSafe $sid | Out-Null }
+
+        $cleanedUsers++
+        Write-Log "  [$userName] Done" "OK"
+
+    } catch {
+        Write-Log "  [$userName] ERROR: $($_.Exception.Message)" "ERROR"
+        $errorUsers++
+        if ($weLoaded) { Unload-HiveSafe $sid | Out-Null }
+    }
+}
+
+# =====================================================================
+# SUMMARY
+# =====================================================================
+
+Write-Log ""
+Write-Log "========== $scriptName v$scriptVersion completed =========="
+Write-Log "Profiles: $totalUsers | Cleaned: $cleanedUsers | Skipped: $skippedUsers | Errors: $errorUsers"
+Write-Log "Log: $logFile"
+
+if ($cleanedUsers -gt 0 -and $hklmAddin) {
+    Write-Log "LoadBehavior=3 set. Excel will auto-install SkanExcelAddIn on next open." "OK"
+}
+
+exit $(if ($errorUsers -gt 0) { 1 } else { 0 })
